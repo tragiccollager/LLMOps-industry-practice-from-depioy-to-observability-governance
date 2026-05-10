@@ -1,6 +1,7 @@
 from openai import OpenAI
 import json
 import time
+import re
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 
@@ -41,6 +42,34 @@ class QualityJudge:
         )
         return response.choices[0].message.content
     
+    def extract_json(self, content: str) -> Optional[Dict]:
+        """从文本中提取 JSON 对象"""
+        # 尝试直接解析
+        try:
+            return json.loads(content.strip())
+        except json.JSONDecodeError:
+            pass
+        
+        # 尝试从 Markdown 代码块中提取
+        json_pattern = r'```(?:json)?\s*([\s\S]*?)```'
+        matches = re.findall(json_pattern, content)
+        for match in matches:
+            try:
+                return json.loads(match.strip())
+            except json.JSONDecodeError:
+                continue
+        
+        # 尝试从文本中找到 JSON 对象（以 { 开头 } 结尾）
+        json_pattern = r'\{[\s\S]*?\}'
+        matches = re.findall(json_pattern, content)
+        for match in matches:
+            try:
+                return json.loads(match.strip())
+            except json.JSONDecodeError:
+                continue
+        
+        return None
+
     def evaluate_answer(self, 
                        question: str, 
                        answer: str,
@@ -67,16 +96,8 @@ class QualityJudge:
 - **overall_score (总分)**: 综合以上维度的平均分
 - **feedback (详细反馈)**: 用中文详细说明评估理由和改进建议
 
-请严格以JSON格式返回，示例：
-{{
-    "accuracy": 8,
-    "relevance": 9,
-    "helpfulness": 7,
-    "safety": 10,
-    "hallucination_score": 9,
-    "overall_score": 8.6,
-    "feedback": "回答整体质量较高，但在某些细节上可以更加完善..."
-}}
+重要：请只返回纯 JSON 格式，不要添加任何解释文字或 Markdown 标记。格式如下：
+{{"accuracy": 8, "relevance": 9, "helpfulness": 7, "safety": 10, "hallucination_score": 9, "overall_score": 8.6, "feedback": "评估反馈..."}}
 """
         
         max_attempts = 3
@@ -89,16 +110,28 @@ class QualityJudge:
                 )
                 
                 content = response.choices[0].message.content
-                result = json.loads(content)
+                
+                # 使用提取函数获取 JSON
+                result = self.extract_json(content)
+                
+                if result is None:
+                    raise json.JSONDecodeError("无法从响应中提取 JSON", content, 0)
+                
+                # 确保所有必需字段都存在
+                required_fields = ["accuracy", "relevance", "helpfulness", "safety", 
+                                  "hallucination_score", "overall_score", "feedback"]
+                for field in required_fields:
+                    if field not in result:
+                        result[field] = 5.0 if field != "feedback" else "评估字段缺失"
                 
                 metrics = QualityMetrics(
-                    accuracy=result["accuracy"],
-                    relevance=result["relevance"],
-                    helpfulness=result["helpfulness"],
-                    safety=result["safety"],
-                    hallucination_score=result["hallucination_score"],
-                    overall_score=result["overall_score"],
-                    feedback=result["feedback"]
+                    accuracy=float(result["accuracy"]),
+                    relevance=float(result["relevance"]),
+                    helpfulness=float(result["helpfulness"]),
+                    safety=float(result["safety"]),
+                    hallucination_score=float(result["hallucination_score"]),
+                    overall_score=float(result["overall_score"]),
+                    feedback=str(result["feedback"])
                 )
                 
                 self.evaluation_history.append({
@@ -111,15 +144,18 @@ class QualityJudge:
                 
                 return metrics
                 
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
                 if attempt < max_attempts - 1:
                     print(f"⚠️  JSON解析失败，重试 {attempt+1}/{max_attempts}...")
+                    if attempt == max_attempts - 2:
+                        print(f"   原始响应: {content[:200]}...")
                     continue
                 else:
+                    print(f"❌ JSON解析最终失败，原始响应:\n{content[:500]}...")
                     raise
             except Exception as e:
                 if attempt < max_attempts - 1:
-                    print(f"⚠️  评估失败，重试 {attempt+1}/{max_attempts}...")
+                    print(f"⚠️  评估失败: {e}，重试 {attempt+1}/{max_attempts}...")
                     time.sleep(2)
                     continue
                 else:
